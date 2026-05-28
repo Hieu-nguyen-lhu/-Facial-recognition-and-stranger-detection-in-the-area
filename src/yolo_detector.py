@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import time
 from typing import Iterable
 
 import cv2
@@ -29,20 +30,59 @@ class Detection:
         return self.x1, self.y1, self.x2, self.y2
 
 
+def _resolve_device(device: str) -> str:
+    """Phân giải device='auto' thành 'cuda' (nếu có GPU) hoặc 'cpu'."""
+    try:
+        import torch  # type: ignore
+        has_cuda = torch.cuda.is_available()
+    except Exception:
+        has_cuda = False
+
+    if device == "cuda" and not has_cuda:
+        return "cpu"
+        
+    if device != "auto":
+        return device
+        
+    return "cuda" if has_cuda else "cpu"
+
+
 class YoloDetector:
     def __init__(
         self,
         model_path: str,
         confidence: float = 0.45,
         target_labels: Iterable[str] | None = None,
+        device: str = "auto",
     ) -> None:
+        self._device = _resolve_device(device)
         self.model = YOLO(model_path)
         self.confidence = confidence
         self.target_labels = set(target_labels or ["person"])
+        self.last_inference_ms: float = 0.0   # thời gian infer frame gần nhất (ms)
+
+    @property
+    def device_name(self) -> str:
+        """Tên thiết bị dễ đọc: 'CPU' hoặc 'CUDA:0'."""
+        d = self._device.lower()
+        if d == "cpu":
+            return "CPU"
+        if d.startswith("cuda"):
+            suffix = d[4:]  # ":0", ":1" …
+            return f"CUDA{suffix}" if suffix else "CUDA:0"
+        return self._device.upper()
 
     def detect(self, frame) -> list[Detection]:
-        # Tối ưu hóa tốc độ: Sử dụng imgsz=416 để tăng tốc độ phát hiện người trên CPU gấp 2-3 lần
-        result = self.model(frame, imgsz=416, conf=self.confidence, verbose=False)[0]
+        t0 = time.perf_counter()
+        result = self.model(
+            frame,
+            imgsz=416,
+            conf=self.confidence,
+            verbose=False,
+            device=self._device,
+        )[0]
+        self.last_inference_ms = (time.perf_counter() - t0) * 1000.0
+
         detections: list[Detection] = []
         names = result.names
 

@@ -67,6 +67,11 @@ class KnownFacesAdminApp(tk.Tk):
         self.has_unread_notifications = False
         self.bell_canvas: tk.Canvas | None = None
         self.bell_icon: tk.PhotoImage | None = None
+        # --- Controls chọn mô hình và thiết bị xử lý ---
+        self.model_var = tk.StringVar(value="yolov8n (nhanh)")
+        self.device_var = tk.StringVar(value="Auto")
+        self.process_mode_var = tk.StringVar(value="Tu dong")
+        self.process_every_var = tk.StringVar(value="1")
 
         self._build_layout()
         self.refresh_camera_devices()
@@ -162,6 +167,63 @@ class KnownFacesAdminApp(tk.Tk):
             fg=MUTED,
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT)
+
+        # --- Hàng chọn mô hình và thiết bị xử lý ---
+        model_row = tk.Frame(controls, bg=SURFACE)
+        model_row.pack(fill=tk.X, pady=(10, 0))
+
+        tk.Label(model_row, text="Mô hình YOLO", bg=SURFACE, fg=MUTED, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.model_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.model_var,
+            values=(
+                "yolov8n (nhanh nhất)",
+                "yolov8s (nhanh)",
+                "yolov8m (cân bằng)",
+                "yolov8l (chính xác)",
+                "yolov8x (chính xác nhất)",
+                "yolov5n (YOLOv5 - nhanh nhất)",
+                "yolov5s (YOLOv5 - nhanh)",
+                "yolov5m (YOLOv5 - cân bằng)",
+                "yolov5l (YOLOv5 - chính xác)",
+            ),
+            width=28,
+            state="readonly",
+        )
+        self.model_combo.pack(side=tk.LEFT, padx=(8, 16))
+
+        tk.Label(model_row, text="Thiết bị", bg=SURFACE, fg=MUTED, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.device_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.device_var,
+            values=("Auto", "CPU", "CUDA (GPU)"),
+            width=14,
+            state="readonly",
+        )
+        self.device_combo.pack(side=tk.LEFT, padx=(8, 16))
+
+        tk.Label(model_row, text="Xử lý frame", bg=SURFACE, fg=MUTED, font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        self.proc_mode_combo = ttk.Combobox(
+            model_row,
+            textvariable=self.process_mode_var,
+            values=("Tu dong", "Thu cong"),
+            width=11,
+            state="readonly",
+        )
+        self.proc_mode_combo.pack(side=tk.LEFT, padx=(8, 8))
+        self.proc_mode_combo.bind("<<ComboboxSelected>>", self._on_process_mode_change)
+
+        self.proc_every_label = tk.Label(model_row, text="Mỗi", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9))
+        self.proc_every_label.pack(side=tk.LEFT)
+        self.proc_every_spin = ttk.Spinbox(
+            model_row,
+            textvariable=self.process_every_var,
+            from_=1, to=6, width=3,
+            state="disabled",
+        )
+        self.proc_every_spin.pack(side=tk.LEFT, padx=(4, 4))
+        self.proc_every_unit = tk.Label(model_row, text="frame", bg=SURFACE, fg=MUTED, font=("Segoe UI", 9))
+        self.proc_every_unit.pack(side=tk.LEFT)
 
         search_row = tk.Frame(controls, bg=SURFACE)
         search_row.pack(fill=tk.X, pady=(12, 0))
@@ -371,19 +433,73 @@ class KnownFacesAdminApp(tk.Tk):
             return
         os.startfile(target)
 
+    def _on_process_mode_change(self, _event=None) -> None:
+        """Bật/tắt Spinbox process_every dựa trên chế độ chọn."""
+        if self.process_mode_var.get() == "Thu cong":
+            self.proc_every_spin.configure(state="normal")
+        else:
+            self.proc_every_spin.configure(state="disabled")
+
+    def _get_model_path(self) -> str:
+        """Chuyển tên model hiển thị thành tên file .pt."""
+        model_map = {
+            "yolov8n (nhanh nhất)": "yolov8n.pt",
+            "yolov8s (nhanh)": "yolov8s.pt",
+            "yolov8m (cân bằng)": "yolov8m.pt",
+            "yolov8l (chính xác)": "yolov8l.pt",
+            "yolov8x (chính xác nhất)": "yolov8x.pt",
+            "yolov5n (YOLOv5 - nhanh nhất)": "yolov5n.pt",
+            "yolov5s (YOLOv5 - nhanh)": "yolov5s.pt",
+            "yolov5m (YOLOv5 - cân bằng)": "yolov5m.pt",
+            "yolov5l (YOLOv5 - chính xác)": "yolov5l.pt",
+        }
+        return model_map.get(self.model_var.get(), "yolov8n.pt")
+
+    def _get_device_arg(self) -> str:
+        """Chuyển tên device hiển thị thành arg cho main.py."""
+        device_map = {
+            "Auto": "auto",
+            "CPU": "cpu",
+            "CUDA (GPU)": "cuda",
+        }
+        return device_map.get(self.device_var.get(), "auto")
+
     def open_monitoring_camera(self) -> None:
         project_dir = Path(__file__).resolve().parent
         python_executable = sys.executable
         camera_source = self.get_camera_source()
+        model_path = self._get_model_path()
+        device_arg = self._get_device_arg()
+        is_manual = self.process_mode_var.get() == "Thu cong"
+        process_mode_arg = "manual" if is_manual else "auto"
+        try:
+            process_every_val = max(1, min(6, int(self.process_every_var.get())))
+        except ValueError:
+            process_every_val = 2
+
         try:
             creationflags = 0
             if os.name == "nt":
                 creationflags = subprocess.CREATE_NO_WINDOW
             if getattr(sys, "frozen", False):
-                command = [python_executable, "--monitor", "--source", camera_source]
+                command = [
+                    python_executable, "--monitor",
+                    "--source", camera_source,
+                    "--model", model_path,
+                    "--device", device_arg,
+                    "--process-mode", process_mode_arg,
+                    "--process-every", str(process_every_val),
+                ]
                 cwd = Path(sys.executable).resolve().parent
             else:
-                command = [python_executable, str(project_dir / "main.py"), "--source", camera_source]
+                command = [
+                    python_executable, str(project_dir / "main.py"),
+                    "--source", camera_source,
+                    "--model", model_path,
+                    "--device", device_arg,
+                    "--process-mode", process_mode_arg,
+                    "--process-every", str(process_every_val),
+                ]
                 cwd = project_dir
             ensure_project_dirs()
             stdout_log = (LOGS_DIR / "monitor_stdout.log").open("a", encoding="utf-8")

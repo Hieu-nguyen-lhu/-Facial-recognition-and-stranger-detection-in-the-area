@@ -40,6 +40,7 @@ from src.config import (
     ensure_project_dirs,
 )
 from src.face_recognizer import FaceRecognizer, RecognitionResult
+from src.perf_monitor import PerfSampler, PerfSnapshot
 from src.yolo_detector import Detection, YoloDetector
 
 
@@ -621,9 +622,121 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vote-window", type=int, default=DEFAULT_RECOGNITION_VOTE_WINDOW, help="Number of recent frames used for recognition voting.")
     parser.add_argument("--vote-min", type=int, default=DEFAULT_RECOGNITION_VOTE_MIN, help="Minimum votes needed before a known/unknown result is accepted.")
     parser.add_argument("--candidate-vote-min", type=int, default=DEFAULT_RECOGNITION_CANDIDATE_VOTE_MIN, help="Minimum stable borderline votes before accepting a known person.")
-    parser.add_argument("--process-every", type=int, default=1, help="Run YOLO/face recognition every N camera frames while displaying every frame.")
+    parser.add_argument("--process-every", type=int, default=1, help="Run YOLO/face recognition every N camera frames (dùng khi --process-mode=manual).")
+    parser.add_argument("--process-mode", choices=["auto", "manual"], default="auto",
+                        help="'auto': tu dong dieu chinh process_every theo CPU/GPU load. 'manual': dung gia tri --process-every co dinh.")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto",
+                        help="Thiet bi xu ly YOLO: 'auto' tu detect GPU, 'cpu', 'cuda'.")
     parser.add_argument("--debug-recognition", action="store_true", help="Print face recognition score details.")
     return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Performance HUD
+# ---------------------------------------------------------------------------
+
+_PROC_EVERY_MIN = 1
+_PROC_EVERY_MAX = 6
+# --- Ngưỡng CPU chế độ tự động (chỉ áp dụng khi không có GPU) ---
+_CPU_HIGH = 80.0         # % CPU — tăng process_every
+_CPU_LOW  = 45.0         # % CPU — giảm process_every
+_INFER_HIGH_MS = 100.0   # ms inference trên CPU — tăng process_every
+_INFER_LOW_MS  = 50.0    # ms inference trên CPU — giảm process_every
+# --- Ngưỡng GPU (inference GPU nhanh hơn nhiều) ---
+_GPU_INFER_HIGH_MS = 40.0  # ms inference trên GPU — tăng process_every
+_GPU_INFER_LOW_MS  = 20.0  # ms inference trên GPU — giảm process_every
+_GPU_LOAD_HIGH = 90.0      # % GPU load — tăng process_every
+
+
+def _model_short_name(model_path: str) -> str:
+    """Rút gọn tên model để hiển thị, ví dụ 'yolov8n' từ đường dẫn dài."""
+    stem = Path(model_path).stem  # e.g. 'yolov8n'
+    return stem
+
+
+def draw_perf_hud(
+    frame,
+    snap: PerfSnapshot,
+    detector: YoloDetector,
+    fps: float,
+    process_every: int,
+    process_mode: str,
+    model_name: str,
+) -> None:
+    """Vẽ overlay HUD hiệu suất ở góc trên-phải của frame."""
+    h, w = frame.shape[:2]
+
+    # --- Chuẩn bị các dòng text ---
+    gpu = snap.primary_gpu
+    if gpu is not None:
+        vram_used = gpu.mem_used_mb / 1024
+        vram_total = gpu.mem_total_mb / 1024
+        gpu_line = f"GPU {gpu.load_percent:.0f}%  VRAM {vram_used:.1f}/{vram_total:.1f}GB  {gpu.name}"
+    else:
+        gpu_line = "GPU: Khong co"
+
+    mode_tag = "auto" if process_mode == "auto" else "manual"
+    lines = [
+        f"CPU {snap.cpu_percent:.0f}%  RAM {snap.ram_used_gb:.1f}/{snap.ram_total_gb:.1f}GB",
+        gpu_line,
+        f"Model: {model_name}  Dev: {detector.device_name}  Infer: {detector.last_inference_ms:.0f}ms",
+        f"FPS: {fps:.1f}  ProcEvery: {process_every} ({mode_tag})",
+    ]
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.50
+    thickness = 1
+    line_h = 20
+    pad_x, pad_y = 8, 6
+    max_line_w = max(cv2.getTextSize(line, font, font_scale, thickness)[0][0] for line in lines)
+    box_w = max_line_w + pad_x * 2
+    box_h = line_h * len(lines) + pad_y * 2
+    x0 = w - box_w - 8
+    y0 = 8
+
+    # Nền tối mờ
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
+
+    # Viền mỏng
+    cv2.rectangle(frame, (x0, y0), (x0 + box_w, y0 + box_h), (60, 60, 60), 1)
+
+    # Text từng dòng
+    colors = [
+        (180, 220, 255),   # CPU/RAM — xanh nhạt
+        (120, 255, 180) if gpu is not None else (120, 120, 120),  # GPU — xanh lá hoặc xám
+        (255, 220, 100),   # Model/Device/Infer — vàng
+        (200, 200, 200),   # FPS/ProcEvery — trắng xám
+    ]
+    for index, (line, color) in enumerate(zip(lines, colors)):
+        ty = y0 + pad_y + line_h * index + 14
+        cv2.putText(frame, line, (x0 + pad_x, ty), font, font_scale, color, thickness, cv2.LINE_AA)
+
+
+def _adaptive_process_every(
+    current: int,
+    snap: PerfSnapshot,
+    infer_ms: float,
+    using_gpu: bool,
+) -> int:
+    """Tự động điều chỉnh process_every dựa trên CPU/GPU load và thời gian inference."""
+    if using_gpu and snap.primary_gpu is not None:
+        # Chế độ GPU: dùng ngưỡng inference GPU và GPU load
+        gpu_load = snap.primary_gpu.load_percent
+        if infer_ms > _GPU_INFER_HIGH_MS or gpu_load > _GPU_LOAD_HIGH:
+            return min(current + 1, _PROC_EVERY_MAX)
+        if infer_ms < _GPU_INFER_LOW_MS and gpu_load < 70.0 and current > _PROC_EVERY_MIN:
+            return max(current - 1, _PROC_EVERY_MIN)
+        return current
+    else:
+        # Chế độ CPU: dùng ngưỡng CPU%
+        cpu = snap.cpu_percent
+        if cpu > _CPU_HIGH or infer_ms > _INFER_HIGH_MS:
+            return min(current + 1, _PROC_EVERY_MAX)
+        if cpu < _CPU_LOW and infer_ms < _INFER_LOW_MS and current > _PROC_EVERY_MIN:
+            return max(current - 1, _PROC_EVERY_MIN)
+        return current
 
 
 def show_camera_error(message: str) -> None:
@@ -664,7 +777,12 @@ def main() -> int:
         candidate_min_votes=args.candidate_vote_min,
     )
     liveness = MotionLivenessVerifier()
-    detector = YoloDetector(args.model, confidence=args.confidence, target_labels=["person"])
+    detector = YoloDetector(
+        args.model,
+        confidence=args.confidence,
+        target_labels=["person"],
+        device=args.device,
+    )
     alerts = AlertLogger(
         CAPTURES_DIR,
         LOGS_DIR,
@@ -672,24 +790,45 @@ def main() -> int:
         stranger_hold_seconds=args.stranger_hold_seconds,
     )
 
+    # --- Khởi động Performance Sampler ---
+    perf_sampler = PerfSampler(interval=0.5)
+    perf_sampler.start()
+
     camera_result = open_camera_source(args.source)
     camera = camera_result.camera
     if camera is None:
+        perf_sampler.stop()
         show_camera_error(camera_result.error or f"Khong mo duoc nguon camera/video: {args.source}")
         return 1
 
-    log_message(f"YOLO model: {args.model}")
+    model_name = _model_short_name(args.model)
+    log_message(f"YOLO model: {args.model}  |  Device: {detector.device_name}  |  Process mode: {args.process_mode}")
     log_message(f"Camera source: {camera_result.source} | Backend: {camera_result.backend_name}")
     log_message(f"Face backend: {recognizer.backend} | Known faces: {recognizer.known_count}")
     if recognizer.known_count == 0:
         log_message("Canh bao: Chua load duoc anh nguoi quen nao trong known_faces/. Hay them nguoi bang admin_app.py.")
+
+    using_gpu = "CUDA" in detector.device_name.upper() or "GPU" in detector.device_name.upper()
     process_every = max(1, args.process_every)
-    log_message(f"Che do muot: hien thi moi frame, xu ly nhan dien moi {process_every} frame.")
-    log_message("Nhan q de thoat, s de luu snapshot.")
+    process_mode = args.process_mode
+    if using_gpu and process_mode == "auto":
+        process_every = 1
+
+    log_message(f"Che do muot: hien thi moi frame, xu ly nhan dien moi {process_every} frame (mode={process_mode}, GPU={using_gpu}).")
+    log_message("Nhan q: thoat | s: snapshot | m: tang process_every | n: giam process_every")
+
     window_name = "Security monitoring - YOLO stranger detection"
     blank_frame_count = 0
     frame_index = 0
     latest_display_frame = None
+
+    # --- FPS tracking ---
+    fps_counter = 0
+    fps_value = 0.0
+    fps_last_time = time.monotonic()
+
+    # --- Adaptive process_every: chỉ điều chỉnh mỗi 2s ---
+    last_adapt_time = time.monotonic()
 
     state = ProcessingState()
     state_lock = threading.Lock()
@@ -746,6 +885,21 @@ def main() -> int:
             break
         frame_index += 1
 
+        # --- FPS ---
+        fps_counter += 1
+        now = time.monotonic()
+        elapsed_fps = now - fps_last_time
+        if elapsed_fps >= 1.0:
+            fps_value = fps_counter / elapsed_fps
+            fps_counter = 0
+            fps_last_time = now
+
+        # --- Adaptive process_every (chế độ auto) ---
+        if process_mode == "auto" and now - last_adapt_time >= 2.0:
+            snap = perf_sampler.snapshot()
+            process_every = _adaptive_process_every(process_every, snap, detector.last_inference_ms, using_gpu)
+            last_adapt_time = now
+
         if float(frame.std()) < 1.0:
             blank_frame_count += 1
             if blank_frame_count == 1 or blank_frame_count % 60 == 0:
@@ -789,6 +943,19 @@ def main() -> int:
                 2,
                 cv2.LINE_AA,
             )
+
+        # --- Vẽ HUD hiệu suất ---
+        perf_snap = perf_sampler.snapshot()
+        draw_perf_hud(
+            display_frame,
+            perf_snap,
+            detector,
+            fps_value,
+            process_every,
+            process_mode,
+            model_name,
+        )
+
         latest_display_frame = display_frame
         cv2.imshow(window_name, display_frame)
         key = cv2.waitKey(1) & 0xFF
@@ -800,11 +967,21 @@ def main() -> int:
             snapshot_frame = latest_display_frame if latest_display_frame is not None else frame
             snapshot = alerts.save_snapshot(snapshot_frame)
             log_message(f"Da luu snapshot: {snapshot}")
+        # --- Phím m/n: điều chỉnh process_every thủ công ---
+        if key == ord("m"):
+            process_every = min(process_every + 1, _PROC_EVERY_MAX)
+            process_mode = "manual"
+            log_message(f"[Manual] process_every -> {process_every}")
+        if key == ord("n"):
+            process_every = max(process_every - 1, _PROC_EVERY_MIN)
+            process_mode = "manual"
+            log_message(f"[Manual] process_every -> {process_every}")
 
     with worker_condition:
         stop_worker = True
         worker_condition.notify()
     worker.join(timeout=2.0)
+    perf_sampler.stop()
     camera.release()
     cv2.destroyAllWindows()
     return 0
